@@ -99,6 +99,13 @@ export async function readFramesAroundTime({ filePath, streamIndex, aroundTime, 
   return readFrames({ filePath, from, to, streamIndex });
 }
 
+// 读取视频流总帧数（容器元数据 nb_frames，只读文件头不解码；缺失返回 undefined）
+export async function readStreamFrameCount({ filePath, streamIndex }: { filePath: string, streamIndex: number }) {
+  const { stdout } = await runFfprobe(['-v', 'error', '-select_streams', String(streamIndex), '-show_entries', 'stream=nb_frames', '-of', 'csv=p=0', filePath], { logCli: false });
+  const parsed = parseInt(new TextDecoder().decode(stdout).trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+}
+
 export async function readKeyframesAroundTime({ filePath, streamIndex, aroundTime, window }: { filePath: string, streamIndex: number, aroundTime: number, window: number }) {
   const frames = await readFramesAroundTime({ filePath, aroundTime, streamIndex, window });
   return frames.filter((frame) => frame.keyframe);

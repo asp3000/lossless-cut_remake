@@ -4,7 +4,7 @@ import minBy from 'lodash/minBy';
 import maxBy from 'lodash/maxBy';
 import invariant from 'tiny-invariant';
 
-import type { DefiniteSegmentBase, PlaybackMode, SegmentBase, SegmentTags, SegmentToExport, StateSegment } from './types';
+import type { DefiniteSegmentBase, PlaybackMode, SegmentBase, SegmentTags, SegmentTransform, SegmentToExport, StateSegment } from './types';
 
 
 export const isDurationValid = (duration?: number): duration is number => duration != null && Number.isFinite(duration) && duration > 0;
@@ -14,6 +14,7 @@ export const createSegment = (props?: {
   end?: number | undefined,
   name?: string | undefined,
   tags?: unknown | undefined,
+  transform?: SegmentTransform | undefined,
   initial?: true,
   selected?: boolean,
 }): Omit<StateSegment, 'segColorIndex'> => ({
@@ -29,6 +30,8 @@ export const createSegment = (props?: {
     ? Object.fromEntries(Object.entries(props.tags).map(([key, value]) => [key, String(value)]))
     : undefined,
 
+  transform: props?.transform,
+
   ...(props?.initial && { initial: true }),
 });
 
@@ -38,9 +41,9 @@ export const addSegmentColorIndex = (segment: Omit<StateSegment, 'segColorIndex'
 });
 
 export const mapSaveableSegments = (segments: StateSegment[]) => segments.map(({
-  start, end, name, tags, selected,
+  start, end, name, tags, transform, selected,
 }) => ({
-  start, end, name, tags, selected,
+  start, end, name, tags, transform, selected,
 }));
 
 // in the past we had non-string tags
@@ -295,3 +298,13 @@ export function makeDurationSegments(segmentDuration: number, totalDuration: num
 export const isInitialSegment = (segments: StateSegment[]) => segments.length === 0 || (segments.length === 1 && segments[0]!.initial);
 
 export const getGuaranteedSegments = <T extends SegmentToExport>(segments: T[], fileDuration: number | undefined) => (segments.length > 0 ? segments : [{ start: 0, end: fileDuration ?? 0, name: '', originalIndex: 0 }]);
+
+// [帧号精确合并] 判断分段是否无缝铺满整个源视频（起点≈0、相邻首尾相接、末段≈文件结尾）。
+// 满足时合并切割可走「纯视频 concat + 从源视频单遍复制音轨」流程，保证与源视频时长/帧数一致。
+export const segmentsTileFile = (segments: { start: number, end: number }[], fileDuration: number | undefined, eps = 0.05) => {
+  if (fileDuration == null || segments.length === 0) return false;
+  const sorted = [...segments].sort((a, b) => a.start - b.start);
+  return sorted[0]!.start <= eps
+    && fileDuration - sorted[sorted.length - 1]!.end <= eps
+    && sorted.every((s, i) => i === 0 || Math.abs(s.start - sorted[i - 1]!.end) <= eps);
+};

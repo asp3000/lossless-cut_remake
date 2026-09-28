@@ -1,7 +1,7 @@
 import type { CSSProperties, ClipboardEvent, Dispatch, FormEvent, SetStateAction } from 'react';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion } from 'motion/react';
-import { MdRotate90DegreesCcw } from 'react-icons/md';
+import { MdRotate90DegreesCcw, MdRotate90DegreesCw, MdFlip } from 'react-icons/md';
 import { useTranslation } from 'react-i18next';
 import { IoIosCamera, IoMdKey, IoMdSpeedometer } from 'react-icons/io';
 import { FaYinYang, FaTrashAlt, FaStepBackward, FaStepForward, FaCaretLeft, FaCaretRight, FaPause, FaPlay, FaImages, FaKey, FaExclamationTriangle } from 'react-icons/fa';
@@ -26,7 +26,7 @@ import { isExactDurationMatch } from './util/duration';
 import useUserSettings from './hooks/useUserSettings';
 import useActionTitle from './hooks/useActionTitle';
 import { askForPlaybackRate, checkAppPath } from './dialogs';
-import type { FormatTimecode, GetFrameCount, ParseTimecode, PlaybackMode, SegmentColorIndex, SegmentToExport, StateSegment } from './types';
+import type { FormatTimecode, GetFrameCount, ParseTimecode, PlaybackMode, SegmentColorIndex, SegmentToExport, SegmentTransform, StateSegment } from './types';
 import type { WaveformMode } from '../../common/types';
 import type { Frame } from './ffmpeg';
 import mainApi from './mainApi';
@@ -260,7 +260,7 @@ const CutTimeInput = memo(({ disabled, darkMode, cutTime, setCutTime, startTimeO
 
 function BottomBar({
   zoom, setZoom, timelineToggleComfortZoom,
-  isRotationSet, rotation, areWeCutting, increaseRotation, cleanupFilesDialog,
+  isRotationSet, rotation, areWeCutting, increaseRotation, segmentTransform, toggleSegmentTransform, cycleSegmentRotation, cleanupFilesDialog,
   captureSnapshot, onExportPress, segmentsToExport, hasVideo,
   seekAbs, currentSegIndexSafe, cutSegments, currentCutSeg, setCutStart, setCutEnd,
   setCurrentSegIndex,
@@ -280,6 +280,9 @@ function BottomBar({
   rotation: number,
   areWeCutting: boolean,
   increaseRotation: () => void,
+  segmentTransform: SegmentTransform | undefined,
+  toggleSegmentTransform: (key: 'hflip' | 'vflip') => void,
+  cycleSegmentRotation: () => void,
   cleanupFilesDialog: () => void,
   captureSnapshot: () => void,
   onExportPress: () => void,
@@ -590,6 +593,33 @@ function BottomBar({
             />
             <span style={{ textAlign: 'right', display: 'inline-block', fontSize: '.8em', marginLeft: '.1em' }}>{isRotationSet && rotationStr}</span>
           </div>
+        )}
+
+        {/* Per-segment transforms (only affect the currently selected segment) */}
+        {isFileOpened && !simpleMode && hasVideo && currentCutSeg != null && (
+          <>
+            <div onClick={() => toggleSegmentTransform('hflip')} role="button" style={{ whiteSpace: 'nowrap' }}>
+              <MdFlip
+                style={{ fontSize: '1.3em', verticalAlign: 'middle', color: segmentTransform?.hflip ? primaryTextColor : undefined }}
+                title={t('Horizontal flip (current segment)')}
+              />
+              {segmentTransform?.hflip && <span style={{ fontSize: '.8em' }}>H</span>}
+            </div>
+            <div onClick={() => toggleSegmentTransform('vflip')} role="button" style={{ whiteSpace: 'nowrap' }}>
+              <MdFlip
+                style={{ fontSize: '1.3em', verticalAlign: 'middle', transform: 'rotate(90deg)', color: segmentTransform?.vflip ? primaryTextColor : undefined }}
+                title={t('Vertical flip (current segment)')}
+              />
+              {segmentTransform?.vflip && <span style={{ fontSize: '.8em' }}>V</span>}
+            </div>
+            <div onClick={cycleSegmentRotation} role="button" style={{ whiteSpace: 'nowrap' }}>
+              <MdRotate90DegreesCw
+                style={{ fontSize: '1.3em', verticalAlign: 'middle', color: segmentTransform?.rot != null ? primaryTextColor : undefined }}
+                title={t('Rotate current segment (cycles 90°/180°/270°/none)')}
+              />
+              {segmentTransform?.rot != null && <span style={{ fontSize: '.8em' }}>{segmentTransform.rot}°</span>}
+            </div>
+          </>
         )}
 
         <div style={{ flexGrow: 1 }} />

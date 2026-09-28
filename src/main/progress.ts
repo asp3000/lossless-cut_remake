@@ -21,7 +21,9 @@ export function parseFfmpegProgressLine({ line, customMatcher, duration: duratio
   const timeStr = match[1];
   // console.log(timeStr);
   const match2 = timeStr!.match(/^(-?)(\d+):(\d+):(\d+)\.(\d+)$/);
-  if (!match2) throw new Error(`Invalid time from ffmpeg progress ${timeStr}`);
+  // Unparseable times (e.g. ffmpeg's final stats line "time=N/A") carry no progress
+  // info; skip them instead of throwing, which would only produce error log noise.
+  if (!match2) return undefined;
 
   const sign = match2[1];
 

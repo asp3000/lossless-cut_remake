@@ -24,6 +24,25 @@ export const segmentTagsSchema = z.record(z.string(), z.string());
 
 export type SegmentTags = z.infer<typeof segmentTagsSchema>
 
+// Per-segment visual transform, applied on export (video stream gets re-encoded, audio is still stream-copied)
+export const segmentRotations = [90, 180, 270] as const;
+export type SegmentRotation = typeof segmentRotations[number]
+
+export interface SegmentTransform {
+  hflip?: boolean | undefined,
+  vflip?: boolean | undefined,
+  /** Rotation in degrees clockwise (90/180/270), undefined = don't rotate */
+  rot?: SegmentRotation | undefined,
+}
+
+export type SegmentTransformKey = keyof SegmentTransform
+
+export const segmentTransformSchema = z.object({
+  hflip: z.boolean().optional(),
+  vflip: z.boolean().optional(),
+  rot: z.union([z.literal(90), z.literal(180), z.literal(270)]).optional(),
+});
+
 export type EditingSegmentTags = Record<string, SegmentTags>
 
 // todo remove some time in the future
@@ -47,6 +66,7 @@ export const llcProjectV2Schema = z.object({
     name: z.string(),
     tags: segmentTagsSchema.optional(),
     selected: z.boolean().optional(),
+    transform: segmentTransformSchema.optional(),
   }).array(),
 });
 
@@ -71,6 +91,7 @@ export interface StateSegment extends SegmentBase, SegmentColorIndex {
   name: string;
   segId: string;
   tags?: SegmentTags | undefined;
+  transform?: SegmentTransform | undefined;
   initial?: true,
   selected: boolean,
 }
@@ -79,6 +100,7 @@ export interface SegmentToExport extends DefiniteSegmentBase {
   originalIndex: number,
   name?: string | undefined;
   tags?: SegmentTags | undefined;
+  transform?: SegmentTransform | undefined;
 }
 
 export interface InverseCutSegment extends DefiniteSegmentBase {
@@ -145,7 +167,7 @@ export type CopyfileStreams = {
 
 export interface Chapter { start: number, end: number, name?: string | undefined }
 
-export type LiteFFprobeStream = Pick<FFprobeStream, 'index' | 'codec_type' | 'codec_tag' | 'codec_name' | 'disposition' | 'tags' | 'sample_rate' | 'time_base'>;
+export type LiteFFprobeStream = Pick<FFprobeStream, 'index' | 'codec_type' | 'codec_tag' | 'codec_name' | 'disposition' | 'tags' | 'sample_rate' | 'time_base' | 'has_b_frames'>;
 
 export interface FileStats {
   size: number | bigint,

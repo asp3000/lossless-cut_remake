@@ -9,7 +9,7 @@ import CaptureFormatButton from './CaptureFormatButton';
 import AutoExportToggler from './AutoExportToggler';
 import Switch from './Switch';
 import useUserSettings from '../hooks/useUserSettings';
-import { askForFfPath } from '../dialogs';
+import { askForFfPath, askForOutDir } from '../dialogs';
 import { getEnableImportChaptersOptions, isMasBuild, isStoreBuild } from '../util';
 import type { SupportedLanguage } from '../../../common/i18n';
 import { langNames } from '../../../common/i18n';
@@ -75,7 +75,7 @@ function Settings({
 }) {
   const { t } = useTranslation();
 
-  const { customOutDir, keyframeCut, toggleKeyframeCut, timecodeFormat, setTimecodeFormat, invertCutSegments, setInvertCutSegments, askBeforeClose, setAskBeforeClose, enableImportChapters, setEnableImportChapters, enableAskForFileOpenAction, setEnableAskForFileOpenAction, autoSaveProjectFile, setAutoSaveProjectFile, invertTimelineScroll, setInvertTimelineScroll, language, setLanguage, hideNotifications, setHideNotifications, hideOsNotifications, setHideOsNotifications, autoLoadTimecode, setAutoLoadTimecode, enableAutoHtml5ify, setEnableAutoHtml5ify, customFfPath, setCustomFfPath, storeProjectInWorkingDir, mouseWheelZoomModifierKey, setMouseWheelZoomModifierKey, mouseWheelFrameSeekModifierKey, setMouseWheelFrameSeekModifierKey, mouseWheelKeyframeSeekModifierKey, setMouseWheelKeyframeSeekModifierKey, segmentMouseModifierKey, setSegmentMouseModifierKey, captureFrameMethod, setCaptureFrameMethod, captureFrameQuality, setCaptureFrameQuality, captureFrameFileNameFormat, setCaptureFrameFileNameFormat, enableNativeHevc, setEnableNativeHevc, enableUpdateCheck, setEnableUpdateCheck, allowMultipleInstances, setAllowMultipleInstances, preferStrongColors, setPreferStrongColors, treatInputFileModifiedTimeAsStart, setTreatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, setTreatOutputFileModifiedTimeAsStart, exportConfirmEnabled, toggleExportConfirmEnabled, storeWindowBounds, setStoreWindowBounds, reducedMotion, setReducedMotion, ffmpegHwaccel, setFfmpegHwaccel } = useUserSettings();
+  const { customOutDir, keyframeCut, toggleKeyframeCut, timecodeFormat, setTimecodeFormat, invertCutSegments, setInvertCutSegments, askBeforeClose, setAskBeforeClose, enableImportChapters, setEnableImportChapters, enableAskForFileOpenAction, setEnableAskForFileOpenAction, autoSaveProjectFile, setAutoSaveProjectFile, invertTimelineScroll, setInvertTimelineScroll, language, setLanguage, hideNotifications, setHideNotifications, hideOsNotifications, setHideOsNotifications, autoLoadTimecode, setAutoLoadTimecode, enableAutoHtml5ify, setEnableAutoHtml5ify, customFfPath, setCustomFfPath, storeProjectInWorkingDir, mouseWheelZoomModifierKey, setMouseWheelZoomModifierKey, mouseWheelFrameSeekModifierKey, setMouseWheelFrameSeekModifierKey, mouseWheelKeyframeSeekModifierKey, setMouseWheelKeyframeSeekModifierKey, segmentMouseModifierKey, setSegmentMouseModifierKey, captureFrameMethod, setCaptureFrameMethod, captureFrameQuality, setCaptureFrameQuality, captureFrameFileNameFormat, setCaptureFrameFileNameFormat, enableNativeHevc, setEnableNativeHevc, enableUpdateCheck, setEnableUpdateCheck, allowMultipleInstances, setAllowMultipleInstances, preferStrongColors, setPreferStrongColors, treatInputFileModifiedTimeAsStart, setTreatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, setTreatOutputFileModifiedTimeAsStart, exportConfirmEnabled, toggleExportConfirmEnabled, storeWindowBounds, setStoreWindowBounds, reducedMotion, setReducedMotion, ffmpegHwaccel, setFfmpegHwaccel, tempOutDir, setTempOutDir, hwEncode, setHwEncode } = useUserSettings();
 
   const onLangChange = useCallback<ChangeEventHandler<HTMLSelectElement>>((e) => {
     const { value } = e.target;
@@ -109,6 +109,11 @@ function Settings({
   const clearCustomFfPath = useCallback(() => {
     setCustomFfPath(undefined);
   }, [setCustomFfPath]);
+
+  const changeTempOutDir = useCallback(async () => {
+    const newDir = await askForOutDir(tempOutDir);
+    if (newDir) setTempOutDir(newDir);
+  }, [tempOutDir, setTempOutDir]);
 
   return (
     <table className={styles['settings']}>
@@ -253,6 +258,40 @@ function Settings({
                 {customOutDir ? t('Custom working directory') : t('Same directory as input file')}...
               </Button>
             </OutDirSelector>
+          </td>
+        </Row>
+
+        <Row>
+          <KeyCell>
+            {t('Temporary output directory')}<br />
+            <div style={detailsStyle}>
+              {t('When set, exports are first written to this directory, then copied to the output directory and the temp files are deleted. Recommended when the output directory is on a network drive.')}
+            </div>
+          </KeyCell>
+          <td>
+            <Truncated maxWidth="15em">{tempOutDir}</Truncated>
+            <Button onClick={changeTempOutDir}>
+              <FaFolder style={{ marginRight: '.3em', verticalAlign: 'middle' }} />
+              {tempOutDir ? t('Change') : t('Choose directory')}...
+            </Button>
+            {tempOutDir && (
+              <Button onClick={() => setTempOutDir(undefined)}>
+                <FaTimes style={{ marginRight: '.3em', verticalAlign: 'middle' }} />
+                {t('Disable')}
+              </Button>
+            )}
+          </td>
+        </Row>
+
+        <Row>
+          <KeyCell>
+            {t('Enable hardware encoding (NVENC)')}<br />
+            <div style={detailsStyle}>
+              {t('When enabled, re-encoded segments (rotated/flipped) are encoded with the NVIDIA GPU instead of the CPU. Greatly reduces CPU usage. Only affects MP4 output; WebM always uses CPU encoding.')}
+            </div>
+          </KeyCell>
+          <td>
+            <Switch checked={hwEncode} onCheckedChange={setHwEncode} />
           </td>
         </Row>
 

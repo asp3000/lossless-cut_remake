@@ -17,8 +17,8 @@ import { createSegment, sortSegments, invertSegments, combineOverlappingSegments
 import type { FfmpegDialog } from '../ffmpegParameters';
 import { parameters as allFfmpegParameters, getHint, getLabel } from '../ffmpegParameters';
 import { maxSegmentsAllowed } from '../util/constants';
-import type { DefiniteSegmentBase, ParseTimecode, SegmentBase, SegmentToExport, StateSegment, UpdateSegAtIndex } from '../types';
-import { segmentTagsSchema } from '../types';
+import type { DefiniteSegmentBase, ParseTimecode, SegmentBase, SegmentTransform, SegmentToExport, StateSegment, UpdateSegAtIndex } from '../types';
+import { segmentRotations, segmentTagsSchema } from '../types';
 import safeishEval from '../worker/eval';
 import type { FFprobeFormat, FFprobeStream } from '../../../common/ffprobe';
 import type { HandleError } from '../contexts';
@@ -959,6 +959,30 @@ function useSegments({ filePath, workingRef, setWorking, setProgress, videoStrea
     toggleSegmentSelected(currentCutSeg);
   }, [currentCutSeg, toggleSegmentSelected]);
 
+  // Toggle a per-segment visual transform (hflip/vflip) on the current segment.
+  // Applied at export time: segments without a transform are stream-copied, segments
+  // with one get their video re-encoded with the matching ffmpeg filters.
+  const toggleCurrentSegmentTransform = useCallback((key: 'hflip' | 'vflip') => {
+    if (currentCutSeg == null) return;
+    const current = currentCutSeg.transform ?? {};
+    const newTransform: SegmentTransform = { ...current, [key]: !current[key] };
+    const isSet = Object.values(newTransform).some(Boolean);
+    updateSegAtIndex(currentSegIndexSafe, { transform: isSet ? newTransform : undefined });
+  }, [currentCutSeg, currentSegIndexSafe, updateSegAtIndex]);
+
+  // Cycle the current segment's rotation: none → 90° → 180° → 270° → none
+  // (similar to the global rotation button)
+  const cycleCurrentSegmentRotation = useCallback(() => {
+    if (currentCutSeg == null) return;
+    const current = currentCutSeg.transform ?? {};
+    // undefined (not set) → 90 → 180 → 270 → undefined
+    const idx = segmentRotations.findIndex((r) => r === current.rot);
+    const next = idx === -1 ? segmentRotations[0] : segmentRotations[idx + 1];
+    const newTransform: SegmentTransform = { ...current, rot: next };
+    const isSet = newTransform.hflip === true || newTransform.vflip === true || newTransform.rot != null;
+    updateSegAtIndex(currentSegIndexSafe, { transform: isSet ? newTransform : undefined });
+  }, [currentCutSeg, currentSegIndexSafe, updateSegAtIndex]);
+
   return {
     cutSegments,
     cutSegmentsHistory,
@@ -1018,6 +1042,8 @@ function useSegments({ filePath, workingRef, setWorking, setProgress, videoStrea
     mutateSegmentsByExpr,
     toggleSegmentSelected,
     selectOnlySegment,
+    toggleCurrentSegmentTransform,
+    cycleCurrentSegmentRotation,
     setCutTime,
     updateSegAtIndex,
     findSegmentsAtCursor,

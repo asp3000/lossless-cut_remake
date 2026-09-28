@@ -307,7 +307,7 @@ async function startPlayback({ path, slaveVideo, masterVideo, videoStreamIndex, 
   processChunk();
 }
 
-function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, masterVideoRef, mediaSourceQuality, ffmpegHwaccel }: {
+function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, masterVideoRef, mediaSourceQuality, ffmpegHwaccel, segmentTransformStyle }: {
   rotate: number | undefined,
   filePath: string,
   videoStream: FFprobeStream | undefined,
@@ -315,6 +315,8 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
   masterVideoRef: RefObject<HTMLVideoElement | null>,
   mediaSourceQuality: number,
   ffmpegHwaccel: FfmpegHwAccel,
+  // [片段级变换预览] 当前播放片段的变换样式（CSS transform），叠加在预览内容之上
+  segmentTransformStyle?: CSSProperties | undefined,
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -409,11 +411,22 @@ function MediaSourcePlayer({ rotate, filePath, videoStream, audioStreams, master
     position: 'absolute', left: 0, right: 0, top: 0, bottom: 0, display: 'block', width: '100%', height: '100%', objectFit: 'contain', transform: rotate ? `rotate(${rotate}deg)` : undefined,
   }), [rotate]);
 
+  // 片段级变换叠加在全局旋转之上：先应用全局旋转（已重编码进预览流），再叠加片段变换
+  const transformedStyle = useMemo<CSSProperties>(() => {
+    if (segmentTransformStyle == null) return videoStyle;
+    const baseTransform = rotate ? `rotate(${rotate}deg)` : undefined;
+    return {
+      ...videoStyle,
+      ...segmentTransformStyle,
+      transform: [segmentTransformStyle.transform, baseTransform].filter(Boolean).join(' ') || undefined,
+    };
+  }, [segmentTransformStyle, videoStyle, rotate]);
+
   return (
     <div style={{ width: '100%', height: '100%', left: 0, right: 0, top: 0, bottom: 0, position: 'absolute', overflow: 'hidden', background: 'black', pointerEvents: 'none' }}>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-      <video style={{ ...videoStyle, visibility: showCanvas ? 'hidden' : 'initial' }} ref={videoRef} playsInline onError={onVideoError} tabIndex={-1} onFocusCapture={onFocus} />
-      <canvas style={{ ...videoStyle, display: showCanvas ? 'initial' : 'none' }} ref={canvasRef} />
+      <video style={{ ...transformedStyle, visibility: showCanvas ? 'hidden' : 'initial' }} ref={videoRef} playsInline onError={onVideoError} tabIndex={-1} onFocusCapture={onFocus} />
+      <canvas style={{ ...transformedStyle, display: showCanvas ? 'initial' : 'none' }} ref={canvasRef} />
 
       {loading && (
         <div style={{ position: 'absolute', top: 0, bottom: 0, left: 0, right: 0, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>

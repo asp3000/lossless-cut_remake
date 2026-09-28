@@ -90,7 +90,7 @@ export function abortFfmpegs() {
 }
 
 function handleProgress(
-  process: { stderr: Readable | null },
+  process: { stderr: Readable | null } & Promise<unknown>,
   duration: number | undefined,
   onProgress: (a: number) => void,
   customMatcher?: (a: string) => void,
@@ -99,18 +99,40 @@ function handleProgress(
   if (process.stderr == null) return;
   onProgress(0);
 
+  // Throttle progress callbacks: ffmpeg prints stats lines frequently, and every
+  // callback crosses the remote IPC boundary and re-renders the entire app UI.
+  // Always emit start and completion immediately; intermediate updates max 1 per 500ms.
+  let lastEmit = performance.now();
+  let lastProgress = 0;
+  const throttledOnProgress = (progress: number) => {
+    const now = performance.now();
+    if (progress >= 1 || now - lastEmit >= 500) {
+      lastEmit = now;
+      lastProgress = progress;
+      onProgress(progress);
+    }
+  };
+
   const rl = readline.createInterface({ input: process.stderr });
+  // Keep a short stderr tail so that if ffmpeg fails, the actual error is diagnosable from logs
+  const stderrTail: string[] = [];
   rl.on('line', (line) => {
     // console.log('progress', line);
+    stderrTail.push(line);
+    if (stderrTail.length > 20) stderrTail.shift();
 
     try {
       const progress = parseFfmpegProgressLine({ line, customMatcher, duration });
-      if (progress != null) {
-        onProgress(progress);
+      if (progress != null && progress > lastProgress) {
+        throttledOnProgress(progress);
       }
     } catch (err) {
       logger.error('Failed to parse ffmpeg progress line:', err instanceof Error ? err.message : err);
     }
+  });
+
+  process.catch((err: unknown) => {
+    logger.error('ffmpeg failed:', err instanceof Error ? err.message : err, '| stderr tail:', stderrTail.join(' ⏎ '));
   });
 }
 

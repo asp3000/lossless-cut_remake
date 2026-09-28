@@ -42,6 +42,10 @@ export interface Config {
   captureFormat: CaptureFormat,
   enableCustomOutDir: boolean,
   recentCustomOutDirs: string[],
+  /** When set, exports are written here first, then copied to the final output dir (useful for network drives) */
+  tempOutDir: string | undefined,
+  /** Use hardware video encoder (NVENC) for re-encoded (transformed) segments instead of libx264 */
+  hwEncode: boolean,
   keyframeCut: boolean,
   autoMerge: boolean,
   autoDeleteMergedSegments: boolean,

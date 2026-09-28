@@ -59,6 +59,10 @@ export default function useUserSettingsRoot() {
   useEffect(() => safeSetConfig({ recentCustomOutDirs }), [recentCustomOutDirs]);
   const [enableCustomOutDir, setEnableCustomOutDir] = useState(safeGetConfigInitial('enableCustomOutDir'));
   useEffect(() => safeSetConfig({ enableCustomOutDir }), [enableCustomOutDir]);
+  const [tempOutDir, setTempOutDir] = useState(safeGetConfigInitial('tempOutDir'));
+  useEffect(() => safeSetConfig({ tempOutDir }), [tempOutDir]);
+  const [hwEncode, setHwEncode] = useState(safeGetConfigInitial('hwEncode'));
+  useEffect(() => safeSetConfig({ hwEncode }), [hwEncode]);
   const [keyframeCut, setKeyframeCut] = useState(safeGetConfigInitial('keyframeCut'));
   useEffect(() => safeSetConfig({ keyframeCut }), [keyframeCut]);
   const [preserveMetadata, setPreserveMetadata] = useState(safeGetConfigInitial('preserveMetadata'));
@@ -248,6 +252,8 @@ export default function useUserSettingsRoot() {
     captureFormat,
     recentCustomOutDirs,
     enableCustomOutDir,
+    tempOutDir,
+    hwEncode,
     keyframeCut,
     preserveMetadata,
     preserveMetadataOnMerge,
@@ -323,12 +329,16 @@ export default function useUserSettingsRoot() {
 
     springAnimation,
     customOutDir,
+    tempOutDir,
+    hwEncode,
 
     // setters
     setLastAppVersion,
     setCaptureFormat,
     setCustomOutDir,
     setRecentCustomOutDirs,
+    setTempOutDir,
+    setHwEncode,
     setKeyframeCut,
     setPreserveMetadata,
     setPreserveMetadataOnMerge,

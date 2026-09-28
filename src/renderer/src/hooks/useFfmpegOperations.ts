@@ -4,14 +4,15 @@ import pMap from 'p-map';
 import invariant from 'tiny-invariant';
 import i18n from 'i18next';
 
-import { getSuffixedOutPath, transferTimestamps, getOutFileExtension, getOutDir, getHtml5ifiedPath, unlinkWithRetry, getFrameDuration, isMac, html5ifiedPrefix, html5dummySuffix, assertFileExists } from '../util';
-import { isCuttingStart, isCuttingEnd, runFfmpegWithProgress, getFfCommandLine, getDuration, createChaptersFromSegments, readFileFfprobeMeta, getExperimentalArgs, getVideoTimescaleArgs, logStdoutStderr, runFfmpegConcat, RefuseOverwriteError, runFfmpeg } from '../ffmpeg';
+import { getSuffixedOutPath, transferTimestamps, getOutFileExtension, getOutDir, getHtml5ifiedPath, unlinkWithRetry, getFrameDuration, isMac, html5ifiedPrefix, html5dummySuffix, assertFileExists, copyFilePreserveTimestamps } from '../util';
+import { isCuttingStart, isCuttingEnd, runFfmpegWithProgress, getFfCommandLine, getDuration, createChaptersFromSegments, readFileFfprobeMeta, getExperimentalArgs, getVideoTimescaleArgs, logStdoutStderr, runFfmpegConcat, RefuseOverwriteError, runFfmpeg, readFrames, readStreamFrameCount } from '../ffmpeg';
 import { getEffectiveAvoidNegativeTs, getMapStreamsArgs, getStreamIdsToCopy } from '../util/streams';
 import { needsSmartCut, getCodecParams } from '../smartcut';
-import { getGuaranteedSegments, isDurationValid } from '../segments';
+import { getGuaranteedSegments, isDurationValid, segmentsTileFile } from '../segments';
+import { normalizeFpsAndKeyint, timescaleForFps } from '../util/fpsKeyint';
 import type { FFprobeStream } from '../../../common/ffprobe';
 import type { AvoidNegativeTs, FfmpegHwAccel, Html5ifyMode, PreserveMetadata } from '../../../common/types';
-import { deleteDispositionValue, type AllFilesMeta, type Chapter, type CopyfileStreams, type LiteFFprobeStream, type ParamsByFile, type SegmentToExport } from '../types';
+import { deleteDispositionValue, type AllFilesMeta, type Chapter, type CopyfileStreams, type LiteFFprobeStream, type ParamsByFile, type SegmentToExport, type SegmentTransform } from '../types';
 import type { LossyMode } from '../../../main';
 import { UserFacingError } from '../../errors';
 import mainApi from '../mainApi';
@@ -26,6 +27,29 @@ export class OutputNotWritableError extends Error {
     super();
     this.name = 'OutputNotWritableError';
   }
+}
+
+// [片段级变换] 把片段的 hflip/vflip/rot 变换转为 ffmpeg 视频滤镜链。
+// rot 为顺时针角度：90° = transpose=1，180° = 两次 transpose=1，270° = transpose=2；
+// 先旋转后翻转。fitToSourceDims 用于合并模式下把旋转片段 letterbox 回源尺寸，
+// 避免 concat 时各分段帧尺寸不一致。
+function getTransformVideoFilters(transform: SegmentTransform | undefined, fitToSourceDims: { width: number, height: number } | undefined): string[] {
+  if (transform == null) return [];
+  const filters: string[] = [];
+  if (transform.rot != null) {
+    if (transform.rot === 270) filters.push('transpose=2');
+    else if (transform.rot === 180) filters.push('transpose=1', 'transpose=1');
+    else filters.push('transpose=1');
+  }
+  if (transform.hflip) filters.push('hflip');
+  if (transform.vflip) filters.push('vflip');
+  if (fitToSourceDims != null) {
+    filters.push(
+      `scale=${fitToSourceDims.width}:${fitToSourceDims.height}:force_original_aspect_ratio=decrease`,
+      `pad=${fitToSourceDims.width}:${fitToSourceDims.height}:(ow-iw)/2:(oh-ih)/2`,
+    );
+  }
+  return filters;
 }
 
 async function writeChaptersFfmetadata(outDir: string, chapters: Chapter[] | undefined) {
@@ -44,6 +68,75 @@ async function writeChaptersFfmetadata(outDir: string, chapters: Chapter[] | und
 // Muxers implemented by ffmpeg's movenc.c, i.e. the ones that accept `-movflags`.
 // Note: deliberately not util/streams.ts `isMov`, which is a narrower, UI oriented list.
 const movencFormats = new Set(['3g2', '3gp', 'f4v', 'ipod', 'ismv', 'mov', 'mp4', 'psp']);
+
+// [帧号精确吸附] 关键帧切割（流复制）下，ffmpeg 的 `-ss` 输入寻址实际落在 ≤ 切点的
+// 关键帧上，而帧数若按名义切点计算，分段之间就会出现内容缝隙或重复（各段帧数之和
+// 与源一致只是巧合性抵消）。这里一次性扫描全部关键帧（packet 标志位，纯解封装），
+// 把每段起点吸附到 ≤ start 的关键帧，帧数取相邻段实际起点帧号之差（telescoping）：
+// 分段铺满整个文件时，各段帧数之和恒等于源视频总帧数，且段间无缝无重叠。
+// 仅在"只复制视频流"（无音轨等其它流）时启用——此时无需 -t 限制音频，
+// `-frames:v` 可以独立决定视频长度。
+async function computeSnappedFrameRanges({ filePath, videoStreamIndex, segments, fps, fileDuration }: {
+  filePath: string,
+  videoStreamIndex: number,
+  segments: SegmentToExport[],
+  fps: number,
+  fileDuration: number | undefined,
+}): Promise<{ ssTime: number | undefined, frameCount: number }[] | undefined> {
+  const frames = await readFrames({ filePath, streamIndex: videoStreamIndex });
+  if (frames.length === 0) return undefined;
+  const kfTimes = frames.filter((frame) => frame.keyframe).map((frame) => frame.time);
+  if (kfTimes.length === 0) return undefined;
+  const firstPacketTime = frames[0]!.time;
+
+  const totalFrames = await readStreamFrameCount({ filePath, streamIndex: videoStreamIndex })
+    // 元数据缺失时用 (fileDuration - 首包时间) * fps 估算；仍不可用则放弃吸附
+    ?? (fileDuration != null && Number.isFinite(fileDuration) ? Math.round((fileDuration - firstPacketTime) * fps) : undefined);
+  if (totalFrames == null || totalFrames <= 0) return undefined;
+
+  const halfFrame = 0.5 / fps;
+  const relFrame = (t: number) => Math.round((t - firstPacketTime) * fps);
+
+  const starts = segments.map(({ start }) => {
+    if (start <= firstPacketTime + halfFrame) return { startF: 0, ssTime: undefined as number | undefined };
+    let kfTime: number | undefined;
+    for (let i = kfTimes.length - 1; i >= 0; i -= 1) {
+      if (kfTimes[i]! <= start + halfFrame) { kfTime = kfTimes[i]; break; }
+    }
+    if (kfTime == null) return undefined;
+    return { startF: relFrame(kfTime), ssTime: kfTime };
+  });
+  if (starts.some((s) => s == null)) return undefined;
+
+  const tiling = segmentsTileFile(segments, fileDuration);
+  const eps = 0.05;
+  const result: { ssTime: number | undefined, frameCount: number }[] = [];
+  for (let i = 0; i < segments.length; i += 1) {
+    const { end } = segments[i]!;
+    const s = starts[i]!;
+    let endF: number;
+    if (tiling) {
+      // 铺满模式：本段终点 = 下一段实际起点；末段 = 源视频总帧数
+      endF = i < segments.length - 1 ? starts[i + 1]!.startF : totalFrames;
+    } else if (fileDuration != null && fileDuration - end <= eps) {
+      endF = totalFrames;
+    } else {
+      endF = relFrame(end);
+    }
+    const frameCount = endF - s.startF;
+    if (frameCount < 1) return undefined;
+    result.push({ ssTime: s.ssTime, frameCount });
+  }
+  // 铺满模式下吸附后的起点必须严格递增，否则会出现段间重叠
+  if (tiling) {
+    for (let i = 1; i < result.length; i += 1) {
+      const prev = starts[i - 1]!.startF;
+      const cur = starts[i]!.startF;
+      if (cur <= prev) return undefined;
+    }
+  }
+  return result;
+}
 
 // Muxers implemented by ffmpeg's matroskaenc.c, i.e. the ones that accept `-default_mode`.
 const matroskaencFormats = new Set(['matroska', 'webm']);
@@ -94,7 +187,7 @@ export async function maybeMkDeepOutDir({ outputDir, fileOutPath }: { outputDir:
 }
 
 
-function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, isEncoding, lossyMode, enableOverwriteOutput, outputPlaybackRate, cutFromAdjustmentFrames, cutToAdjustmentFrames, appendLastCommandsLog, encCustomBitrate, appendFfmpegCommandLog, ffmpegHwaccel }: {
+function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, isEncoding, lossyMode, enableOverwriteOutput, outputPlaybackRate, cutFromAdjustmentFrames, cutToAdjustmentFrames, appendLastCommandsLog, encCustomBitrate, appendFfmpegCommandLog, ffmpegHwaccel, hwEncode }: {
   filePath: string | undefined,
   treatInputFileModifiedTimeAsStart: boolean,
   treatOutputFileModifiedTimeAsStart: boolean | null | undefined,
@@ -108,6 +201,8 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
   encCustomBitrate: number | undefined,
   appendFfmpegCommandLog: (args: string[]) => void,
   ffmpegHwaccel: FfmpegHwAccel,
+  // [硬件编码] 有变换片段重编码时改用 NVENC（h264_nvenc），大幅降低 CPU 占用
+  hwEncode: boolean,
 }) {
   const shouldSkipExistingFile = useCallback(async (path: string) => {
     const fileExists = await mainApi.pathExists(path);
@@ -128,7 +223,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
   const getOutputPlaybackRateArgs = useCallback(() => (outputPlaybackRate !== 1 ? ['-itsscale', String(1 / outputPlaybackRate)] : []), [outputPlaybackRate]);
 
-  const concatFiles = useCallback(async ({ paths, outDir, outPath, metadataFromPath, includeAllStreams, streams, outFormat, ffmpegExperimental, onProgress = () => undefined, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase }: {
+  const concatFiles = useCallback(async ({ paths, outDir, outPath, metadataFromPath, includeAllStreams, streams, outFormat, ffmpegExperimental, onProgress = () => undefined, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase, videoOnly }: {
     paths: string[],
     outDir: string | undefined,
     outPath: string,
@@ -143,6 +238,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     chapters: Chapter[] | undefined,
     preserveMetadataOnMerge: boolean,
     videoTimebase?: number | undefined,
+    videoOnly?: boolean | undefined,
   }) => {
     if (await shouldSkipExistingFile(outPath)) return { haveExcludedStreams: false };
 
@@ -190,9 +286,12 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         chaptersInputIndex = addInput(getChaptersInputArgs(chaptersPath));
       }
 
-      const { streamIdsToCopy, excludedStreamIds } = getStreamIdsToCopy({ streams, includeAllStreams });
+      // [帧号精确合并] videoOnly: 只映射真正的视频流（排除封面图 attached_pic），
+      // 用于"纯视频 concat（时间轴严格精确）+ 从源视频单遍复制音轨"的合并切割流程
+      const streamsToMap = videoOnly ? streams.filter((s) => s.codec_type === 'video' && s.disposition?.attached_pic !== 1) : streams;
+      const { streamIdsToCopy, excludedStreamIds } = getStreamIdsToCopy({ streams: streamsToMap, includeAllStreams });
       const mapStreamsArgs = getMapStreamsArgs({
-        allFilesMeta: { [metadataFromPath]: { streams } },
+        allFilesMeta: { [metadataFromPath]: { streams: streamsToMap } },
         copyFileStreams: [{ path: metadataFromPath, streamIds: streamIdsToCopy }],
         outFormat,
         manuallyCopyDisposition: true,
@@ -254,7 +353,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
   const losslessCutSingle = useCallback(async ({
     keyframeCut: ssBeforeInput, avoidNegativeTs, copyFileStreams, cutFrom, cutTo, chaptersPath, onProgress, outPath,
-    fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, detectedFps,
+    fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, detectedFps, videoOnly, preciseFrameCount, preciseCutFrom, transform, fitToSourceDims, forceTranscode,
   }: {
     keyframeCut: boolean,
     avoidNegativeTs: AvoidNegativeTs | undefined,
@@ -276,7 +375,15 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     movFastStart: boolean,
     paramsByFile: ParamsByFile,
     videoTimebase?: number | undefined,
-    detectedFps?: number,
+    detectedFps?: number | undefined,
+    videoOnly?: boolean | undefined,
+    preciseFrameCount?: number | undefined,
+    preciseCutFrom?: number | undefined,
+    // [片段级变换] 有变换的片段：视频流加滤镜重编码，其余流仍流复制
+    transform?: SegmentTransform | undefined,
+    fitToSourceDims?: { width: number, height: number } | undefined,
+    // [B 帧结构统一] 合并模式下源带 B 帧且存在转码段时，本段强制转码（见 cutMultiple 内注释）
+    forceTranscode?: boolean | undefined,
   }) => {
     const frameDuration = getFrameDuration(detectedFps);
 
@@ -291,10 +398,49 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     if (detectedFps != null) cutDuration = Math.max(cutDuration, frameDuration); // ensure at least one frame duration
 
     // Don't cut if not needed: https://github.com/mifi/lossless-cut/issues/50
-    const cutFromArgs = cuttingStart ? ['-ss', formatFfmpegNumber(cutFromWithAdjustment)] : [];
-    const cutToArgs = cuttingEnd ? ['-t', formatFfmpegNumber(cutDuration)] : [];
+    // [帧号精确吸附] preciseCutFrom 是 ≤ cutFrom 的实际关键帧时间，-ss 落点与
+    // 帧数计算的基准一致，消除段间缝隙/重叠
+    const cutFromArgs = cuttingStart ? ['-ss', formatFfmpegNumber(preciseCutFrom ?? cutFromWithAdjustment)] : [];
+    // preciseFrameCount 模式下只复制视频流，无需 -t 限制音频；且 -t 的名义时长
+    // 会把吸附后多出的尾部视频帧截掉，必须省略
+    const cutToArgs = cuttingEnd && preciseFrameCount == null ? ['-t', formatFfmpegNumber(cutDuration)] : [];
 
-    const copyFileStreamsFiltered = copyFileStreams.filter(({ streamIds }) => streamIds.length > 0);
+    // [帧号精确合并] videoOnly: 切分时只保留视频流（排除封面图），用于"铺满分段"的
+    // 合并切割流程——纯视频分段文件时长精确，concat 时间轴零漂移，音轨最后从源视频复制
+    const copyFileStreamsFiltered = (videoOnly
+      ? copyFileStreams.map(({ path, streamIds }) => ({
+        path,
+        streamIds: streamIds.filter((streamId) => {
+          const stream = allFilesMeta[path]?.streams.find((s) => s.index === streamId);
+          return stream != null && stream.codec_type === 'video' && stream.disposition?.attached_pic !== 1;
+        }),
+      }))
+      : copyFileStreams).filter(({ streamIds }) => streamIds.length > 0);
+
+    // [帧率与 GOP 归一] 关键帧间隔按 0.2~0.5s 区间动态计算，≥24fps 归一到 6 的倍数，
+    // 非整数帧率（29.97/30.1）四舍五入后以固定 CFR 输出
+    const { outFps, keyint } = normalizeFpsAndKeyint(detectedFps ?? 30);
+    // [帧率归一判定] 归一后帧率与源不同（如 29.97→30、50→48）时视频需转码；webm 不做帧率归一
+    const fpsNeedsNormalize = detectedFps != null && outFormat !== 'webm' && outFps !== detectedFps;
+
+    // [帧号精确切割] 关键帧切割（流复制）模式下，`-t` 按 dts 截断，在 B 帧重排的
+    // 视频里会多带入若干帧，导致各分段帧数之和与源视频不一致（分段经外部工具
+    // 处理后按序 concat -c copy 时无法与源视频逐帧对齐）。
+    // 这里按帧号计算本段精确视频帧数 N = round(cutTo*fps) - round(cutFrom*fps)，
+    // 追加 `-frames:v N` 对视频流做确定性截断；`-t` 保留用于限制音频流。
+    // 用绝对帧号差可伸缩（telescoping）：各段帧数之和恒等于 round(总时长*fps)。
+    // 仅在：关键帧切割 + 已检测到帧率 + 单输入文件（不含外部附加文件）时启用。
+    // 末段若到文件结尾（cuttingEnd 为 false），用 fileDuration 作为终点同样截断。
+    // 注意：帧率归一转码时帧率会变，按源帧率数出的帧数在输出帧率下不成立，必须跳过。
+    // B 帧结构统一强制转码（forceTranscode）不改变帧率，帧数计算依然精确，保留之——
+    // 各段帧数之和恒等于 round(总时长*fps)，保证合并后总时长与源一致（telescoping）。
+    const canUsePreciseFrames = ssBeforeInput && detectedFps != null && copyFileStreamsFiltered.length === 1;
+    const preciseEnd = cuttingEnd ? cutToWithAdjustment : (isDurationValid(fileDuration) ? fileDuration : undefined);
+    const framesVPreciseArgs = fpsNeedsNormalize || !canUsePreciseFrames || preciseEnd == null
+      ? []
+      : preciseFrameCount != null
+        ? ['-frames:v', String(preciseFrameCount)]
+        : ['-frames:v', String(Math.max(1, Math.round(preciseEnd * detectedFps) - Math.round(cutFromWithAdjustment * detectedFps)))];
 
     // remove -avoid_negative_ts make_zero when not cutting start (no -ss), or else some videos get blank first frame in QuickLook
     // note: `make_zero`/`make_non_negative` get downgraded to `auto` when copying a cover art stream, or else the
@@ -327,11 +473,85 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         '-i', copyFileStreamsFiltered[0]!.path,
         ...(!ssBeforeInput ? cutFromArgs : []),
         ...cutToArgs,
+        ...framesVPreciseArgs,
       ];
 
     const chaptersInputIndex = copyFileStreamsFiltered.length;
 
     const rotationArgs = rotation !== undefined ? ['-display_rotation:v:0', String(360 - rotation)] : [];
+
+    invariant(filePath != null);
+
+    // [片段级变换] 找到主文件被复制的第一条视频流，为它注入滤镜 + 编码器参数。
+    // 通过 getVideoArgs 扩展点：返回的参数会替代该输出流默认的 -c:N copy。
+    const transformVideoFilters = getTransformVideoFilters(transform, fitToSourceDims);
+    const mainCopiedVideoStreamId = copyFileStreamsFiltered.find(({ path }) => path === filePath)?.streamIds.find((streamId) => {
+      const stream = allFilesMeta[filePath]?.streams.find((s) => s.index === streamId);
+      return stream != null && stream.codec_type === 'video' && stream.disposition?.attached_pic !== 1;
+    });
+    // [转码判定] 有变换必转码；无变换时若帧率需归一（如 29.97→30、50→48）也转码，
+    // 以固定帧率输出；相同则维持流复制。合并模式下源带 B 帧且存在转码段时，
+    // 流复制段被强制转码（forceTranscode，由 cutMultiple 计算传入），保证全片结构一致。
+    const segmentNeedsTranscode = transformVideoFilters.length > 0 || fpsNeedsNormalize || forceTranscode;
+    const getTransformVideoArgs = segmentNeedsTranscode && mainCopiedVideoStreamId != null
+      ? ({ streamIndex, outputIndex }: { streamIndex: number, outputIndex: number }) => {
+        if (streamIndex !== mainCopiedVideoStreamId) return undefined;
+        const isWebm = outFormat === 'webm';
+        // [对齐源编码参数] 源视频为 CFR + 强制固定 GOP + bt709/high@4.1 + timescale 15360。
+        // 重编码片段若用 ffmpeg 默认行为（保留 VFR 时间戳、默认 GOP），concat 后会变成动态帧率；
+        // 因此把源的全部可复现参数带上，让输出与源一致。GOP/帧率按 normalizeFpsAndKeyint 动态计算。
+        // webm 无 NVENC 编码器，始终用 libvpx-vp9；mp4 勾选硬件编码时用 NVENC，
+        // -b:v 0 让 -cq 真正生效（否则会套用默认 2Mbps 码率上限）
+        let encodeArgs: string[];
+        if (isWebm) {
+          encodeArgs = [`-c:${outputIndex}`, 'libvpx-vp9', `-crf:${outputIndex}`, '30', '-b:v', '0'];
+        } else if (hwEncode) {
+          encodeArgs = [
+            `-c:${outputIndex}`, 'h264_nvenc', '-preset', 'p6', '-tune', 'hq', '-rc', 'vbr', `-cq:${outputIndex}`, '19', '-b:v', '0',
+            // NVENC 版的源参数复刻：固定 GOP、强制 IDR 关键帧、最小化 GOP 码率波动、禁用 scenecut
+            // 对应 x264 的 keyint=N:min-keyint=N:scenecut=0:force-cfr=1（帧率 CFR 由 -fps_mode cfr 保证）
+            // （ffmpeg 8 布尔选项必须显式传 1，否则会吞掉下一个参数）
+            `-g:${outputIndex}`, String(keyint), `-forced-idr:${outputIndex}`, '1', `-strict_gop:${outputIndex}`, '1', `-no-scenecut:${outputIndex}`, '1',
+            // [禁用 B 帧] 源视频无 B 帧；转码段若带 B 帧，其 dts 延迟会与流复制段在 concat 交界处
+            // 冲突（ffmpeg 强制 dts 单调会把边界几个 packet 的 duration 弄成 1 tick 的碎片值），
+            // 导致合并成品的 stts 表混入异常时长、部分工具（MediaInfo 等）误判为动态帧率。
+            // 禁用后转码段与 copy 段结构一致，拼接边界干净（实测 1800 帧全部精确 512 tick）。
+            `-bf:${outputIndex}`, '0',
+          ];
+        } else {
+          encodeArgs = [
+            `-c:${outputIndex}`, 'libx264', `-crf:${outputIndex}`, '18', '-preset', 'medium',
+            // 与源一致的 x264 参数：keyint=N:min-keyint=N:scenecut=0:force-cfr=1
+            // bframes=0 同上：源无 B 帧，转码段禁用 B 帧以保证 concat 边界干净
+            `-x264-params:${outputIndex}`, `keyint=${keyint}:min-keyint=${keyint}:scenecut=0:force-cfr=1:bframes=0`,
+          ];
+        }
+        // h264 专属的流级参数（vp9 不接受 high profile / 4.1 level）
+        const h264Args = isWebm ? [] : [
+          `-pix_fmt:${outputIndex}`, 'yuv420p',
+          `-profile:v:${outputIndex}`, 'high',
+          `-level:${outputIndex}`, '4.1',
+          `-r:${outputIndex}`, String(outFps),
+          `-fps_mode:${outputIndex}`, 'cfr',
+          `-color_range:${outputIndex}`, 'tv',
+          `-colorspace:${outputIndex}`, 'bt709',
+          `-color_primaries:${outputIndex}`, 'bt709',
+          `-color_trc:${outputIndex}`, 'bt709',
+        ];
+        // movenc 容器级参数：timescale 与流复制段统一（timescaleForFps，30fps→15360），
+        // concat 时基才能对齐不产生换算误差；brand 同源
+        // （-movflags +faststart / -avoid_negative_ts 由程序既有配置项处理，此处不重复）
+        const movencArgs = outFormat == null || movencFormats.has(outFormat)
+          ? ['-video_track_timescale', String(timescaleForFps(outFps)), '-brand', 'mp42']
+          : [];
+        return [
+          ...(transformVideoFilters.length > 0 ? [`-filter:${outputIndex}`, transformVideoFilters.join(',')] : []),
+          ...encodeArgs,
+          ...h264Args,
+          ...movencArgs,
+        ];
+      }
+      : undefined;
 
     // This function tries to calculate the output stream index needed for -metadata:s:x and -disposition:x arguments
     // It is based on the assumption that copyFileStreamsFiltered contains the order of the input files (and their respective streams orders) sent to ffmpeg, to hopefully calculate the same output stream index values that ffmpeg does internally.
@@ -352,13 +572,17 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
       return streamCount + copiedStreamIndex;
     }
 
-    invariant(filePath != null);
-
     const customFileMetadataArgs = Object.entries(paramsByFile.get(filePath)?.metadata ?? {}).flatMap(([key, value]) => [
       '-metadata', `${key}=${value}`,
     ]);
 
-    const mapStreamsArgs = getMapStreamsArgs({ copyFileStreams: copyFileStreamsFiltered, allFilesMeta, outFormat, needFlac: areWeCutting });
+    const mapStreamsArgs = getMapStreamsArgs({
+      copyFileStreams: copyFileStreamsFiltered,
+      allFilesMeta,
+      outFormat,
+      needFlac: areWeCutting,
+      ...(getTransformVideoArgs != null && { getVideoArgs: getTransformVideoArgs }),
+    });
 
     const customParamsArgs = (() => {
       const ret: string[] = [];
@@ -484,7 +708,17 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
       ...getExperimentalArgs(ffmpegExperimental),
 
-      ...getVideoTimescaleArgs(videoTimebase),
+      // [统一视频轨 timescale] 正常切割路径（videoTimebase 未传）下，流复制段必须与转码段
+      // 使用同一 timescale（timescaleForFps）。若流复制段继承源时基（如 1/90000）而转码段
+      // 是 1/15360，concat demuxer 不做时基换算，复制段 pts 会按原始 tick 数原样写入合并
+      // 成品（1/30s=3000 tick 落进 15360 时基变成 0.195s/帧），导致时长成倍膨胀、且复制段
+      // 的虚高 pts 把后续所有片段顶死（每帧仅 +1 tick）。smart cut 路径显式传源
+      // videoTimebase，其内部两段本就同源时基，保持原行为。
+      ...(videoTimebase != null
+        ? getVideoTimescaleArgs(videoTimebase)
+        : (outFormat == null || movencFormats.has(outFormat)
+          ? ['-video_track_timescale', String(timescaleForFps(normalizeFpsAndKeyint(detectedFps ?? 30).outFps))]
+          : [])),
 
       '-f', outFormat, '-y', outPath,
     ];
@@ -494,7 +728,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     logStdoutStderr(result);
 
     await transferTimestamps({ inPath: filePath, outPath, cutFrom, cutTo, treatInputFileModifiedTimeAsStart, duration: isDurationValid(fileDuration) ? fileDuration : undefined, treatOutputFileModifiedTimeAsStart });
-  }, [appendFfmpegCommandLog, cutFromAdjustmentFrames, cutToAdjustmentFrames, filePath, getOutputPlaybackRateArgs, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart]);
+  }, [appendFfmpegCommandLog, cutFromAdjustmentFrames, cutToAdjustmentFrames, filePath, getOutputPlaybackRateArgs, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart, hwEncode]);
 
   // inspired by https://gist.github.com/fernandoherreradelasheras/5eca67f4200f1a7cc8281747da08496e
   const cutEncodeSmartPart = useCallback(async ({ cutFrom, cutTo, outPath, outFormat, videoCodec, videoBitrate, videoTimebase, allFilesMeta, copyFileStreams, videoStreamIndex, ffmpegExperimental, hasBFrames }: {
@@ -564,7 +798,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
   }, [appendFfmpegCommandLog, filePath]);
 
   const cutMultiple = useCallback(async ({
-    outputDir, customOutDir, segments: segmentsIn, cutFileNames, fileDuration, rotation, detectedFps, onProgress: onTotalProgress, keyframeCut, copyFileStreams, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMetadataOnMerge, preserveMovData, preserveChapters, movFastStart, avoidNegativeTs, paramsByFile, chapters,
+    outputDir, customOutDir, segments: segmentsIn, cutFileNames, fileDuration, rotation, detectedFps, onProgress: onTotalProgress, keyframeCut, copyFileStreams, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMetadataOnMerge, preserveMovData, preserveChapters, movFastStart, avoidNegativeTs, paramsByFile, chapters, videoOnly, fitTransformedToSourceDims, sourceVideoDims, tempOutDir, willMerge,
   }: {
     outputDir: string,
     customOutDir: string | undefined,
@@ -588,6 +822,13 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     avoidNegativeTs: AvoidNegativeTs | undefined,
     paramsByFile: ParamsByFile,
     chapters: Chapter[] | undefined,
+    videoOnly?: boolean | undefined,
+    // [片段级变换] 合并模式下，若只有部分片段旋转了 90°，把旋转片段 letterbox 回源尺寸
+    fitTransformedToSourceDims?: boolean | undefined,
+    sourceVideoDims?: { width: number, height: number } | undefined,
+    // [临时盘] 设置后 ffmpeg 先写该目录，再复制到最终输出目录（合并模式下片段保留在临时目录供 concat）
+    tempOutDir?: string | undefined,
+    willMerge?: boolean | undefined,
   }) => {
     console.log('paramsByFile', paramsByFile);
 
@@ -602,13 +843,47 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     invariant(filePath != null);
     await assertFileExists(filePath);
 
-    const chaptersPath = await writeChaptersFfmetadata(outputDir, chapters);
+    // [帧号精确吸附] 条件：关键帧切割 + 纯流复制（非编码）+ 已检测到帧率
+    // + 仅复制主文件的单条视频流（即"只导视频"场景）
+    // + 帧率无需归一（帧率归一时视频会转码，按源帧率数出的帧数在输出帧率下不成立）
+    let snappedRanges: { ssTime: number | undefined, frameCount: number }[] | undefined;
+    const mainCopyEntry = copyFileStreams.length === 1 ? copyFileStreams[0] : undefined;
+    const mainStreams = mainCopyEntry != null ? allFilesMeta[filePath]?.streams : undefined;
+    const videoOnlyStreamIds = mainCopyEntry != null
+      ? mainCopyEntry.streamIds.filter((streamId) => {
+        const stream = mainStreams?.find((s) => s.index === streamId);
+        return stream != null && stream.codec_type === 'video' && stream.disposition?.attached_pic !== 1;
+      })
+      : [];
+    // [帧率归一] 归一后帧率与源不同（如 29.97→30、50→48）时，所有无变换片段也要转码（webm 不做帧率归一）
+    const fpsNormalized = detectedFps != null && outFormat !== 'webm' && normalizeFpsAndKeyint(detectedFps).outFps !== detectedFps;
+    // [B 帧结构统一] 源视频带 B 帧 + 合并 + 存在任一转码段时，流复制段也强制转码。
+    // 原因：流复制段继承源的 B 帧结构（dts 比 pts 延迟若干帧），而转码段以 -bf 0 输出无 B 帧；
+    // concat demuxer 在「无 B 帧段 ↔ 带 B 帧段」交界处为保持 dts 单调会把边界 packet 的
+    // duration 改写成 1-tick 碎片值，stts 表混入异类时长，MediaInfo 类工具据此误判为可变帧率。
+    // 统一为无 B 帧结构后交界干净（实测混合拼接全程精确 CFR）。全 copy 合并无转码段，不受影响。
+    const sourceVideoHasBFrames = (mainStreams?.find((s) => s.codec_type === 'video' && s.disposition?.attached_pic !== 1)?.has_b_frames ?? 0) > 0;
+    const anySegmentTranscodes = segments.some((s) => ('transform' in s && s.transform != null)) || fpsNormalized;
+    const forceTranscodeAll = willMerge === true && sourceVideoHasBFrames && anySegmentTranscodes && outFormat !== 'webm';
+    if (keyframeCut && !isEncoding && detectedFps != null && !fpsNormalized && !forceTranscodeAll && mainCopyEntry != null
+      && videoOnlyStreamIds.length === 1 && videoOnlyStreamIds[0] === mainCopyEntry.streamIds[0]) {
+      try {
+        snappedRanges = await computeSnappedFrameRanges({
+          filePath, videoStreamIndex: videoOnlyStreamIds[0]!, segments, fps: detectedFps, fileDuration,
+        });
+        if (snappedRanges != null) console.log('Snapped segment boundaries to keyframes:', snappedRanges);
+      } catch (err) {
+        console.error('Failed to snap segments to keyframes, falling back to nominal cut points', err);
+      }
+    }
+
+    const chaptersPath = await writeChaptersFfmetadata(tempOutDir ?? outputDir, chapters);
 
     // This function will either call losslessCutSingle (if no smart cut enabled)
     // or if enabled, will first cut&encode the part before the next keyframe, trying to match the input file's codec params
     // then it will cut the part *from* the keyframe to "end", and concat them together and return the concated file
     // so that for the calling code it looks as if it's just a normal segment
-    const cutSegment = async ({ start: desiredCutFrom, end: cutTo }: { start: number, end: number }, i: number) => {
+    const cutSegment = async ({ start: desiredCutFrom, end: cutTo, transform }: SegmentToExport, i: number) => {
       const onProgress = (progress: number) => onSingleProgress(i, progress / 2);
       const onConcatProgress = (progress: number) => onSingleProgress(i, (1 + progress) / 2);
 
@@ -616,15 +891,31 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
       if (await shouldSkipExistingFile(finalOutPath)) return { path: finalOutPath, created: false };
 
+      // [临时盘] 设置了临时目录时，ffmpeg 先写临时文件，成功后再复制到最终输出目录并删除临时文件。
+      // 合并模式下片段保留在临时目录供后续 concat 使用（由调用方在合并完成后清理）。
+      const outPath = tempOutDir != null ? join(tempOutDir, cutFileNames[i]!) : finalOutPath;
+      if (outPath !== finalOutPath) await mkdir(tempOutDir!, { recursive: true });
+
       await maybeMkDeepOutDir({ outputDir, fileOutPath: finalOutPath });
 
-      if (!isEncoding) {
+      const finishSegment = async (createdPath: string) => {
+        if (tempOutDir == null || willMerge) return { path: createdPath, created: true };
+        await copyFilePreserveTimestamps(createdPath, finalOutPath);
+        await unlinkWithRetry(createdPath);
+        return { path: finalOutPath, created: true };
+      };
+
+      // [片段级变换] 有变换的片段统一走 losslessCutSingle（其内部会对视频流加滤镜重编码），
+      // 不走 smart cut 分支，避免变换被忽略
+      if (!isEncoding || transform != null) {
         // simple lossless cut
         invariant(outFormat != null);
         await losslessCutSingle({
-          cutFrom: desiredCutFrom, cutTo, chaptersPath, outPath: finalOutPath, copyFileStreams, keyframeCut, avoidNegativeTs, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, onProgress: (progress) => onSingleProgress(i, progress),
+          cutFrom: desiredCutFrom, cutTo, chaptersPath, outPath, copyFileStreams, keyframeCut, avoidNegativeTs, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, detectedFps, videoOnly, preciseFrameCount: snappedRanges?.[i]?.frameCount, preciseCutFrom: snappedRanges?.[i]?.ssTime, onProgress: (progress) => onSingleProgress(i, progress),
+          transform, fitToSourceDims: fitTransformedToSourceDims === true ? sourceVideoDims : undefined,
+          forceTranscode: forceTranscodeAll,
         });
-        return { path: finalOutPath, created: true };
+        return finishSegment(outPath);
       }
 
       // we are probably encoding (`isEncoding`: true, smart cut or lossy mode)
@@ -660,8 +951,8 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
       }
 
       const cutEncodeWholePart = async () => {
-        await cutEncodeSmartPartWrapper({ cutFrom: desiredCutFrom, cutTo, outPath: finalOutPath });
-        return { path: finalOutPath, created: true };
+        await cutEncodeSmartPartWrapper({ cutFrom: desiredCutFrom, cutTo, outPath });
+        return finishSegment(outPath);
       };
 
       if (lossyMode) {
@@ -690,15 +981,15 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
 
       const losslessPartOutPath = segmentNeedsSmartCut
         ? getSuffixedOutPath({ customOutDir, filePath, nameSuffix: `smartcut-segment-copy-${i}${ext}` })
-        : finalOutPath;
+        : outPath;
 
       // for smart cut we need to use keyframe cut here, and no avoid_negative_ts
       await losslessCutSingle({
-        cutFrom: losslessCutFrom, cutTo, chaptersPath, outPath: losslessPartOutPath, copyFileStreams: copyFileStreamsFiltered, keyframeCut: true, avoidNegativeTs: undefined, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, onProgress,
+        cutFrom: losslessCutFrom, cutTo, chaptersPath, outPath: losslessPartOutPath, copyFileStreams: copyFileStreamsFiltered, keyframeCut: true, avoidNegativeTs: undefined, fileDuration, rotation, allFilesMeta, outFormat, shortestFlag, ffmpegExperimental, preserveMetadata, preserveMovData, preserveChapters, movFastStart, paramsByFile, videoTimebase, detectedFps, onProgress,
       });
 
       // We don't need to concat, just return the single cut file (we may need smart cut in other segments though)
-      if (!segmentNeedsSmartCut) return { path: finalOutPath, created: true };
+      if (!segmentNeedsSmartCut) return finishSegment(outPath);
 
       // We need to concat
 
@@ -716,8 +1007,8 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         // need to re-read streams because indexes may have changed. Using main file as source of streams and metadata
         const { streams: streamsAfterCut } = await readFileFfprobeMeta(losslessPartOutPath);
 
-        await concatFiles({ paths: smartCutSegmentsToConcat, outDir: outputDir, outPath: finalOutPath, metadataFromPath: losslessPartOutPath, outFormat, includeAllStreams: true, streams: streamsAfterCut, ffmpegExperimental, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase, onProgress: onConcatProgress });
-        return { path: finalOutPath, created: true };
+        await concatFiles({ paths: smartCutSegmentsToConcat, outDir: outputDir, outPath, metadataFromPath: losslessPartOutPath, outFormat, includeAllStreams: true, streams: streamsAfterCut, ffmpegExperimental, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase, onProgress: onConcatProgress });
+        return finishSegment(outPath);
       } finally {
         await tryDeleteFiles(smartCutSegmentsToConcat);
       }
@@ -730,7 +1021,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     }
   }, [shouldSkipExistingFile, isEncoding, filePath, lossyMode, losslessCutSingle, cutEncodeSmartPart, encCustomBitrate, concatFiles]);
 
-  const concatCutSegments = useCallback(async ({ customOutDir, outFormat, segmentPaths, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapterNames, preserveMetadataOnMerge, mergedOutFilePath }: {
+  const concatCutSegments = useCallback(async ({ customOutDir, outFormat, segmentPaths, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapterNames, preserveMetadataOnMerge, mergedOutFilePath, segments, fileDuration, detectedFps }: {
     customOutDir: string | undefined,
     outFormat: string | undefined,
     segmentPaths: string[],
@@ -741,10 +1032,22 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     chapterNames: (string | undefined)[] | undefined,
     preserveMetadataOnMerge: boolean,
     mergedOutFilePath: string,
+    segments: { start: number, end: number }[],
+    fileDuration: number | undefined,
+    detectedFps: number | undefined,
   }) => {
     const outDir = getOutDir(customOutDir, filePath);
 
     if (await shouldSkipExistingFile(mergedOutFilePath)) return;
+
+    invariant(filePath != null);
+
+    // [合并 timescale] 与分段保持一致的 timescale（30fps→15360，每帧恰好 512 tick），
+    // 避免 movenc 自选时基引入换算舍入；仅对 movenc 系容器生效
+    const isMovenc = outFormat == null || movencFormats.has(outFormat);
+    const mergeTimescale = detectedFps != null && isMovenc
+      ? timescaleForFps(normalizeFpsAndKeyint(detectedFps).outFps)
+      : undefined;
 
     const chapters = await createChaptersFromSegments({ paths: segmentPaths, defaultChapterNames: chapterNames });
 
@@ -752,8 +1055,46 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     invariant(metadataFromPath != null);
     // need to re-read streams because may have changed
     const { streams } = await readFileFfprobeMeta(metadataFromPath);
-    await concatFiles({ paths: segmentPaths, outDir, outPath: mergedOutFilePath, metadataFromPath, outFormat, includeAllStreams: true, streams, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge });
-  }, [concatFiles, filePath, shouldSkipExistingFile]);
+
+    // [帧号精确合并] 若分段无缝铺满整个源视频，改用「纯视频 concat（时间轴严格精确）
+    // + 从源视频单遍复制音轨」两遍流程：旧流程直接 concat 含音频的分段时，每段音轨的
+    // AAC 帧粒度/priming/seek 前移与视频 B 帧重排偏移会使 concat demuxer 逐段多推进
+    // 约 0.07~0.09s，长视频累积数秒误差。
+    const segmentsTile = segmentsTileFile(segments, fileDuration);
+
+    if (segmentsTile) {
+      const tmpVideoPath = `${mergedOutFilePath}.tmpvideo`;
+      try {
+        // 第一遍：仅 concat 视频流（每段帧数已由 -frames:v 精确控制，时间轴零漂移）
+        await concatFiles({ paths: segmentPaths, outDir, outPath: tmpVideoPath, metadataFromPath, outFormat, includeAllStreams: true, streams, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase: mergeTimescale, videoOnly: true });
+
+        // 第二遍：从源视频单遍复制音轨（音频连续完整，与源视频一致）
+        const formatArgs: string[] = outFormat != null ? ['-f', outFormat] : [];
+        const muxArgs: string[] = [
+          '-hide_banner',
+          '-i', tmpVideoPath,
+          '-i', filePath,
+          '-map', '0:v',
+          '-map', '1:a?',
+          '-c', 'copy',
+          ...(mergeTimescale != null ? ['-video_track_timescale', String(mergeTimescale)] : []),
+          '-map_metadata', '0',
+          '-map_chapters', '0',
+          ...getMovFlags({ outFormat, preserveMovData, movFastStart }),
+          ...formatArgs,
+          '-y', mergedOutFilePath,
+        ];
+        appendFfmpegCommandLog(muxArgs);
+        const result = await runFfmpeg(muxArgs);
+        logStdoutStderr(result);
+      } finally {
+        await tryDeleteFiles([tmpVideoPath]);
+      }
+      return;
+    }
+
+    await concatFiles({ paths: segmentPaths, outDir, outPath: mergedOutFilePath, metadataFromPath, outFormat, includeAllStreams: true, streams, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase: mergeTimescale });
+  }, [appendFfmpegCommandLog, concatFiles, filePath, shouldSkipExistingFile]);
 
   // This is just used to load something into the player with correct duration,
   // so that the user can seek and then we render frames using ffmpeg & MediaSource
